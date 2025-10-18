@@ -13,7 +13,7 @@ load_dotenv()
 def _split_csv(s: str) -> list[str]:
     return [x.strip() for x in s.split(",") if x.strip()]
 
-origins = _split_csv(os.getenv("ALLOW_ORIGINS", "http://localhost:5173"))
+origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS","*").split(",") if o.strip()]
 
 app = FastAPI(title="FurniFind API", version="1.0.0")
 
