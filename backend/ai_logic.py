@@ -10,19 +10,25 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("ai")
 
 # ---------- env ----------
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
-PINECONE_HOST = os.getenv("PINECONE_HOST", "")  # full data-plane URL (https://....pinecone.io)
-PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "")
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+PINECONE_HOST = os.getenv("PINECONE_HOST")           # optional (data-plane host)
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 HF_MODEL = os.getenv("HF_MODEL", "google/gemma-2b-it")  # you can swap later without redeploy
 TIMEOUT_S = float(os.getenv("HF_TIMEOUT", "18.0"))
 
-if not (PINECONE_API_KEY and PINECONE_HOST and PINECONE_INDEX_NAME):
-    log.error("Missing Pinecone envs. Check PINECONE_API_KEY / PINECONE_HOST / PINECONE_INDEX_NAME")
+if not PINECONE_API_KEY:
+    raise RuntimeError("PINECONE_API_KEY is missing")
 
-# ---------- clients ----------
 pc = Pinecone(api_key=PINECONE_API_KEY)
-index = Index(host=PINECONE_HOST)
+
+if PINECONE_HOST:
+    # When you already know the data-plane host (faster queries)
+    index = pc.Index(host=PINECONE_HOST)
+else:
+    if not PINECONE_INDEX_NAME:
+        raise RuntimeError("PINECONE_INDEX_NAME is missing (needed when PINECONE_HOST is not set)")
+    index = pc.Index(PINECONE_INDEX_NAME)
 
 # MiniLM text encoder
 _enc = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
