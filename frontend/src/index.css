@@ -1,17 +1,8 @@
-@import "tailwindcss";
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
 
-html,
-body,
-#root {
-  height: 100%;
-}
-
-/* hide horizontal scrollbar for chip row */
-.no-scrollbar::-webkit-scrollbar {
-  display: none;
-}
-
-.no-scrollbar {
-  -ms-overflow-style: none;
-  scrollbar-width: none;
+/* optional: subtle defaults for black theme */
+:root {
+  color-scheme: dark;
 }
