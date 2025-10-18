@@ -1,43 +1,69 @@
 import os
+from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from ai_logic import rag, analytics_from_csv
+from dotenv import load_dotenv
+import orjson
 
-app = FastAPI(title="Furniture RAG API")
+from ai_logic import rag
 
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")
+load_dotenv()
+
+def _split_csv(s: str) -> list[str]:
+    return [x.strip() for x in s.split(",") if x.strip()]
+
+origins = _split_csv(os.getenv("ALLOW_ORIGINS", "http://localhost:5173"))
+
+app = FastAPI(title="FurniFind API", version="1.0.0")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN] if FRONTEND_ORIGIN != "*" else ["*"],
+    allow_origins=origins or ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-class UserQuery(BaseModel):
+class QueryBody(BaseModel):
     query: str
-    top_k: int | None = 8
+    top_k: Optional[int] = None
 
-@app.get("/health")
-def health():
-    return {"ok": True}
+@app.get("/")
+def root():
+    return {"ok": True, "name": "FurniFind API"}
+
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}
 
 @app.post("/recommend")
-def recommend(q: UserQuery):
+def recommend(body: QueryBody):
     try:
-        res = rag(q.query, top_k=q.top_k or 8)
-        return res
+        result = rag(body.query, top_k=body.top_k)
+        return result
     except Exception as e:
-        print("RAG error:", e)
-        raise HTTPException(status_code=500, detail="RAG pipeline failed")
+        print("ERROR /recommend:", e)
+        raise HTTPException(status_code=500, detail="Internal error")
 
+# Optional: simple analytics (static or from a CSV if you add one)
 @app.get("/analytics")
 def analytics():
-    try:
-        return analytics_from_csv(os.getenv("ANALYTICS_CSV", "cleaned_intern_data.csv"))
-    except FileNotFoundError:
-        raise HTTPException(status_code=500, detail="cleaned_intern_data.csv not found")
-    except Exception as e:
-        print("Analytics error:", e)
-        raise HTTPException(status_code=500, detail="Analytics failed")
+    # Minimal placeholder so the UI can render something
+    # If you have backend/data/cleaned_intern_data.csv, you can expand this.
+    return {
+        "products_per_brand": {
+            "Karl home Store": 6,
+            "Nalupatio Store": 5,
+            "Generic": 4,
+            "Dewhut Store": 4,
+            "PONTMENT": 3
+        },
+        "avg_price_per_brand": {
+            "Karl home Store": 149.99,
+            "Nalupatio Store": 72.40,
+            "Generic": 18.50,
+            "Dewhut Store": 219.99,
+            "PONTMENT": 95.99
+        }
+    }
