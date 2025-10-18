@@ -1,69 +1,38 @@
-import os
-from typing import Optional
+import os, logging
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from dotenv import load_dotenv
-import orjson
+from pydantic import BaseModel, Field
+from ai_logic import rag, healthcheck
 
-from ai_logic import rag
+log = logging.getLogger("main")
 
-load_dotenv()
-
-def _split_csv(s: str) -> list[str]:
-    return [x.strip() for x in s.split(",") if x.strip()]
-
-origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS","*").split(",") if o.strip()]
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "")
+ALLOWED = [FRONTEND_ORIGIN] if FRONTEND_ORIGIN else []
+ALLOWED += ["http://localhost:5173", "http://127.0.0.1:5173"]
 
 app = FastAPI(title="FurniFind API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins or ["*"],
+    allow_origins=ALLOWED,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-class QueryBody(BaseModel):
-    query: str
-    top_k: Optional[int] = None
+class RecReq(BaseModel):
+    query: str = Field(..., min_length=1)
+    top_k: int = Field(ge=1, le=20, default=8)
 
-@app.get("/")
-def root():
-    return {"ok": True, "name": "FurniFind API"}
-
-@app.get("/healthz")
-def healthz():
-    return {"status": "ok"}
+@app.get("/health")
+def health():
+    return healthcheck()
 
 @app.post("/recommend")
-def recommend(body: QueryBody):
+def recommend(req: RecReq):
     try:
-        result = rag(body.query, top_k=body.top_k)
-        return result
+        out = rag(req.query, top_k=req.top_k)
+        return out
     except Exception as e:
-        print("ERROR /recommend:", e)
+        log.exception("recommend failed: %s", e)
         raise HTTPException(status_code=500, detail="Internal error")
-
-# Optional: simple analytics (static or from a CSV if you add one)
-@app.get("/analytics")
-def analytics():
-    # Minimal placeholder so the UI can render something
-    # If you have backend/data/cleaned_intern_data.csv, you can expand this.
-    return {
-        "products_per_brand": {
-            "Karl home Store": 6,
-            "Nalupatio Store": 5,
-            "Generic": 4,
-            "Dewhut Store": 4,
-            "PONTMENT": 3
-        },
-        "avg_price_per_brand": {
-            "Karl home Store": 149.99,
-            "Nalupatio Store": 72.40,
-            "Generic": 18.50,
-            "Dewhut Store": 219.99,
-            "PONTMENT": 95.99
-        }
-    }
