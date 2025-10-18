@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: furniture-rag-api
+    env: python
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PINECONE_API_KEY
+        sync: false
+      - key: PINECONE_INDEX_NAME
+        value: product-recommendations
+      - key: PINECONE_HOST
+        value: REPLACE_WITH_YOUR_DATA_PLANE_HOST
+      - key: HF_TOKEN
+        sync: false
+      - key: FRONTEND_ORIGIN
+        value: https://your-frontend.onrender.com
