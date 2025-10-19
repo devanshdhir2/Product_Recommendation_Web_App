@@ -1,46 +1,40 @@
-import os, json, re, logging
+import os, re, json, time
 from typing import List, Dict, Any
-import numpy as np
+import pandas as pd
 import httpx
-from sentence_transformers import SentenceTransformer
+
+from fastembed import TextEmbedding
 from pinecone import Pinecone, Index
 
-# ---------- logging ----------
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("ai")
+# ------------ ENV ------------
+PINECONE_API_KEY   = os.getenv("PINECONE_API_KEY", "")
+PINECONE_HOST      = os.getenv("PINECONE_HOST", "")
+PINECONE_INDEX     = os.getenv("PINECONE_INDEX_NAME", "product-recommendations")
 
-# ---------- env ----------
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-PINECONE_HOST = os.getenv("PINECONE_HOST")           # optional (data-plane host)
-PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
-HF_TOKEN = os.getenv("HF_TOKEN", "")
-HF_MODEL = os.getenv("HF_MODEL", "google/gemma-2b-it")  # you can swap later without redeploy
-TIMEOUT_S = float(os.getenv("HF_TIMEOUT", "18.0"))
+HF_TOKEN           = os.getenv("HF_TOKEN", "")
+HF_MODEL_ID        = os.getenv("HF_MODEL_ID", "google/gemma-2b-it")  # you can change via Render env
+HF_URL             = f"https://api-inference.huggingface.co/models/{HF_MODEL_ID}"
 
-if not PINECONE_API_KEY:
-    raise RuntimeError("PINECONE_API_KEY is missing")
+FRONTEND_ORIGIN    = os.getenv("FRONTEND_ORIGIN", "")
 
+# ------------ PINECONE ------------
 pc = Pinecone(api_key=PINECONE_API_KEY)
+index: Index = Index(host=PINECONE_HOST)
 
-if PINECONE_HOST:
-    # When you already know the data-plane host (faster queries)
-    index = pc.Index(host=PINECONE_HOST)
-else:
-    if not PINECONE_INDEX_NAME:
-        raise RuntimeError("PINECONE_INDEX_NAME is missing (needed when PINECONE_HOST is not set)")
-    index = pc.Index(PINECONE_INDEX_NAME)
+# ------------ EMBEDDINGS (fast, low-RAM) ------------
+# 384-dim model, drop-in replacement for all-MiniLM
+_EMB = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")  # tiny + fast
+TEXT_DIM, IMG_DIM = 384, 2048
 
-# MiniLM text encoder
-_enc = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-TEXT_DIM, IMG_DIM = 384, 2048  # matches your Kaggle build (dense + zero-padded img)
+def encode_query_mm(q: str, w_text: float = 1.0) -> List[float]:
+    # fastembed returns a generator
+    vec = next(_EMB.embed([q], normalize=True))
+    vec = [w_text * float(x) for x in vec]
+    return vec + [0.0] * IMG_DIM  # keep index dimension 2432
 
-def _encode_query_mm(q: str, w_text: float = 1.0) -> List[float]:
-    v = _enc.encode(q, normalize_embeddings=True).tolist()
-    v = [w_text * x for x in v]
-    return v + [0.0] * IMG_DIM
-
-def search(query: str, top_k: int = 8, w_text: float = 1.0, filt: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
-    qvec = _encode_query_mm(query, w_text=w_text)
+# ------------ SEARCH ------------
+def search(query: str, top_k: int = 8, w_text: float = 1.0, filt: dict | None = None) -> pd.DataFrame:
+    qvec = encode_query_mm(query, w_text=w_text)
     res = index.query(vector=qvec, top_k=top_k, include_metadata=True, filter=filt or {})
     rows = []
     for m in res.get("matches", []):
@@ -53,85 +47,65 @@ def search(query: str, top_k: int = 8, w_text: float = 1.0, filt: Dict[str, Any]
             "price": md.get("price"),
             "image_url": md.get("image_url"),
         })
-    return rows
+    return pd.DataFrame(rows)
 
-# --- filtering like your notebook ---
-BAD = ("lever","latch","cable","release","hardware","bracket","replacement","webbing","band","repair","modification")
-GOOD = ("sofa","chair","ottoman","bench","couch","table","tray","armchair","stool")
+# ------------ FILTER ------------
+_BAD = ("lever","latch","cable","release","hardware","bracket","replacement","webbing","band","repair","modification")
+_GOOD = ("sofa","chair","ottoman","bench","couch","table","tray","armchair","stool")
 
-def filter_hits(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if not rows: 
-        return rows
-    def keep_ok(t: str) -> bool:
-        t = (t or "").lower()
-        return any(g in t for g in GOOD) and not any(b in t for b in BAD)
-    main = [r for r in rows if keep_ok(r.get("title",""))]
-    if len(main) >= 2:
-        return main[:5]
-    util = [r for r in rows if re.search(r"(tray|table|ottoman|stool)", (r.get("title") or "").lower()) and keep_ok(r.get("title",""))]
-    out = []
-    seen = set()
-    for r in main + util + rows:
-        if r.get("id") not in seen:
-            out.append(r); seen.add(r.get("id"))
-        if len(out) >= 5: break
-    return out
+def filter_hits(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty: 
+        return df
+    t = df["title"].fillna("").str.lower()
+    keep = t.apply(lambda x: any(g in x for g in _GOOD) and not any(b in x for b in _BAD))
+    df2 = df[keep].copy()
+    if len(df2) >= 2:
+        return df2.head(8)
+    util = t.str.contains(r"(tray|table|ottoman|stool)", regex=True) & ~t.apply(lambda x: any(b in x for b in _BAD))
+    extra = df[util].copy()
+    out = pd.concat([df2, extra]).drop_duplicates(subset=["id"])
+    return out.head(8) if len(out) else df.head(8)
 
-# ---------- HF Inference (no GPU) ----------
-_HF_URL = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
-_HDRS = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
-
-def _hf_generate(prompt: str, max_new_tokens: int = 220) -> str:
+# ------------ GENERATION (HF Inference API; no local model) ------------
+def _hf_generate(prompt: str, max_new_tokens: int = 240) -> str:
     if not HF_TOKEN:
-        raise RuntimeError("HF_TOKEN missing or not set on server")
+        return ""
     payload = {
         "inputs": prompt,
         "parameters": {
             "max_new_tokens": max_new_tokens,
-            "do_sample": False,
-            "temperature": 0.0,
+            "temperature": 0.2,
             "repetition_penalty": 1.05,
             "return_full_text": False
         }
     }
-    with httpx.Client(timeout=TIMEOUT_S) as cx:
-        r = cx.post(_HF_URL, headers=_HDRS, json=payload)
-    if r.status_code == 200:
-        out = r.json()
-        if isinstance(out, list) and out and "generated_text" in out[0]:
-            return (out[0]["generated_text"] or "").strip()
-        if isinstance(out, dict) and "generated_text" in out:
-            return (out["generated_text"] or "").strip()
-        return ""
-    # log & raise to trigger fallback
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
     try:
-        log.error("HF error %s: %s", r.status_code, r.text[:400])
+        with httpx.Client(timeout=30) as client:
+            r = client.post(HF_URL, headers=headers, json=payload)
+            if r.status_code == 200:
+                data = r.json()
+                # HF response can be either list[{"generated_text": ...}] or dict
+                if isinstance(data, list) and data and "generated_text" in data[0]:
+                    return str(data[0]["generated_text"])
+                if isinstance(data, dict) and "generated_text" in data:
+                    return str(data["generated_text"])
+            # fallthrough -> empty
     except Exception:
         pass
-    raise RuntimeError(f"HF inference failed {r.status_code}")
+    return ""
 
-def _fallback_write(query: str, titles: List[str]) -> str:
-    # deterministic 4–6 sentences; no external call
-    picks = [t for t in titles if t][:3]
-    if len(picks) >= 2:
-        base = (
-            f"These options offer practical seating and storage for living spaces. "
-            f"\"{picks[0]}\" and \"{picks[1]}\" stand out for everyday comfort and value"
-            + (f", while \"{picks[2]}\" adds a versatile accent." if len(picks) > 2 else ".")
-        )
-    elif len(picks) == 1:
-        base = f"\"{picks[0]}\" is a reliable pick for compact rooms with solid day-to-day usability."
-    else:
-        base = "These picks balance comfort, price, and everyday usability."
-    return base
-
-def _build_prompt(query: str, rows: List[Dict[str, Any]]) -> str:
-    ctx_lines = [f"- {r.get('title','N/A')} (Brand: {r.get('brand','N/A')}, Price: {r.get('price','N/A')})" for r in rows[:5]]
+def gemma_answer(query: str, df_hits: pd.DataFrame, max_new_tokens: int = 220) -> str:
+    titles = [str(t).strip() for t in df_hits.get("title", []).fillna("").tolist() if str(t).strip()]
+    ctx_lines = []
+    for _, r in df_hits.head(6).iterrows():
+        ctx_lines.append(f"- {r.get('title','N/A')} (Brand: {r.get('brand','N/A')}, Price: {r.get('price','N/A')})")
     ctx = "\n".join(ctx_lines) if ctx_lines else "No context."
-    return (
+
+    prompt = (
         "You are a concise, helpful product recommendation assistant.\n"
         "Rules (follow strictly):\n"
-        "- Never refuse; if the exact keyword is missing, pick the closest relevant items from the context and still answer.\n"
+        "- Never say you cannot answer; if the exact keyword is missing, pick the closest relevant items from the context (chairs/sofas/ottomans/benches/trays) and still answer.\n"
         "- Do NOT start with 'Sure', 'Okay', or 'Here is/Here’s'. No emojis or meta-chat.\n"
         "- Write exactly ONE paragraph of 4–6 sentences. Start neutrally (not a brand).\n"
         "- Mention at least two product titles exactly as in the context. Use only the context.\n\n"
@@ -140,39 +114,63 @@ def _build_prompt(query: str, rows: List[Dict[str, Any]]) -> str:
         "Write now."
     )
 
-def gemma_like_answer(query: str, used: List[Dict[str, Any]]) -> str:
-    titles = [r.get("title","") for r in used]
-    prompt = _build_prompt(query, used)
-    text = ""
-    try:
-        text = _hf_generate(prompt, max_new_tokens=220)
-    except Exception as e:
-        log.warning("Falling back text gen: %s", e)
-        text = _fallback_write(query, titles)
+    out = _hf_generate(prompt, max_new_tokens=max_new_tokens)
+    txt = (out or "").strip()
 
-    # sanitize + ensure 4–6 sentences
-    text = re.sub(r"^(sure,?\s*|okay,?\s*|here'?s\s+.*?:\s*)", "", text, flags=re.I).strip()
-    for b in [r"i cannot answer", r"i can't", r"unable", r"i'm here to assist", r"would you like", r"please note",
+    # sanitize openers + meta
+    txt = re.sub(r"^(sure,?\s*|okay,?\s*|here'?s\s+.*?:\s*)", "", txt, flags=re.I).strip()
+    for b in [r"i cannot answer", r"i can't", r"unable", r"not mention", r"no context",
+              r"i'm here to assist", r"would you like", r"let me know", r"please note",
               r"i hope this helps", r"[😊😁🙂😉👍]"]:
-        text = re.sub(b, "", text, flags=re.I)
-    text = re.sub(r"\s+", " ", text).strip()
-    sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
-    if len(sents) < 4:
-        sents += ["These options balance comfort, value, and everyday usability at home."] * (4 - len(sents))
-    return " ".join(sents[:6])
+        txt = re.sub(b, "", txt, flags=re.I)
+    txt = re.sub(r"\s+", " ", txt).strip()
+
+    # ensure ≥2 titles mentioned
+    needed = []
+    for t in titles[:3]:
+        if t and t not in txt:
+            needed.append(t)
+        if len(needed) >= 2:
+            break
+    if needed:
+        txt += " In particular, consider " + " and ".join(f'\"{n}\"' for n in needed[:2]) + "."
+
+    # clamp to 4–6 sentences
+    sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", txt) if s.strip()]
+    while len(sents) < 4:
+        sents.append("These options balance comfort, value, and everyday usability at home.")
+    txt = " ".join(sents[:6])
+
+    # refusal/fallback: deterministic summary if API cold/blocked
+    if len(titles) and (len(txt) < 20 or sum(1 for t in titles if t in txt) < 2):
+        picks = titles[:3]
+        if len(picks) >= 2:
+            txt = (
+                "These options offer practical seating and storage for living spaces. "
+                f"\"{picks[0]}\" and \"{picks[1]}\" stand out for their everyday comfort and value"
+                + (f", while \"{picks[2]}\" adds a versatile accent." if len(picks) > 2 else ".")
+            )
+        else:
+            txt = "These picks balance comfort, price, and everyday usability for compact spaces."
+    return txt
+
+# ------------ RAG ------------
+def _expand_query(q: str) -> str:
+    ql = q.lower()
+    if "sofa" in ql:
+        return "sofa couch chair ottoman bench living room seating"
+    return q
 
 def rag(query: str, top_k: int = 8) -> Dict[str, Any]:
-    # query expansion
-    qx = "sofa couch chair ottoman bench living room seating" if "sofa" in query.lower() else query
-    raw = search(qx, top_k=top_k)
+    raw = search(_expand_query(query), top_k=top_k)
     used = filter_hits(raw)
-    generated = gemma_like_answer(query, used)
-    return {"recommendations": used, "generated_text": generated}
+    text = gemma_answer(query, used)
+    return {"recommendations": used.to_dict(orient="records"), "generated_text": text}
 
+# ------------ HEALTH ------------
 def healthcheck() -> Dict[str, Any]:
     try:
-        stats = index.describe_index_stats()
+        s = index.describe_index_stats()
+        return {"ok": True, "index": PINECONE_INDEX, "total_vector_count": s.get("total_vector_count", 0)}
     except Exception as e:
-        return {"ok": False, "pinecone": f"ERR: {e}"}
-    hf_ok = bool(HF_TOKEN)
-    return {"ok": True, "pinecone": stats, "hf_token": hf_ok, "model": HF_MODEL}
+        return {"ok": False, "error": str(e)}

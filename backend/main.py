@@ -1,38 +1,36 @@
-import os, logging
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Body
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+import os
+
 from ai_logic import rag, healthcheck
 
-log = logging.getLogger("main")
+app = FastAPI(title="FurniFind RAG API", version="1.0.0")
 
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "")
-ALLOWED = [FRONTEND_ORIGIN] if FRONTEND_ORIGIN else []
-ALLOWED += ["http://localhost:5173", "http://127.0.0.1:5173"]
-
-app = FastAPI(title="FurniFind API", version="1.0.0")
+origins = [FRONTEND_ORIGIN] if FRONTEND_ORIGIN else ["*"]  # keep it simple; tighten later
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED,
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-class RecReq(BaseModel):
-    query: str = Field(..., min_length=1)
-    top_k: int = Field(ge=1, le=20, default=8)
+class QueryIn(BaseModel):
+    query: str
+    top_k: int = 8
 
 @app.get("/health")
-def health():
+def _health():
     return healthcheck()
 
 @app.post("/recommend")
-def recommend(req: RecReq):
-    try:
-        out = rag(req.query, top_k=req.top_k)
-        return out
-    except Exception as e:
-        log.exception("recommend failed: %s", e)
-        raise HTTPException(status_code=500, detail="Internal error")
+def _recommend(payload: QueryIn = Body(...)):
+    data = rag(payload.query, top_k=payload.top_k)
+    return data
+
+@app.get("/")
+def _root():
+    return {"ok": True, "service": "FurniFind RAG API"}
