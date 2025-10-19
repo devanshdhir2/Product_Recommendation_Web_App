@@ -10,7 +10,7 @@ load_dotenv()
 # --- ENV ---
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "product-recommendations")
-PINECONE_HOST = os.getenv("PINECONE_HOST", "").strip()  # optional, faster
+PINECONE_HOST = os.getenv("PINECONE_HOST", "").strip()
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 HF_MODEL_ID = os.getenv("HF_MODEL_ID", "google/gemma-2b-it")
 EMBED_MODEL_ID = os.getenv("EMBED_MODEL_ID", "sentence-transformers/all-MiniLM-L6-v2")
@@ -20,7 +20,6 @@ TOP_K_DEFAULT = int(os.getenv("TOP_K_DEFAULT", "8"))
 
 if not PINECONE_API_KEY:
     raise RuntimeError("Missing PINECONE_API_KEY")
-
 if not HF_TOKEN:
     raise RuntimeError("Missing HF_TOKEN")
 
@@ -28,7 +27,9 @@ if not HF_TOKEN:
 pc = Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index(host=PINECONE_HOST) if PINECONE_HOST else pc.Index(PINECONE_INDEX_NAME)
 
-embed_client = InferenceClient(model=EMBED_MODEL_ID, token=HF_TOKEN)
+# Use router for embeddings to avoid 404s on legacy pipeline paths
+HF_API_BASE = os.getenv("HF_API_BASE", "https://router.huggingface.co")
+embed_client = InferenceClient(base_url=HF_API_BASE, token=HF_TOKEN)
 gen_client = InferenceClient(model=HF_MODEL_ID, token=HF_TOKEN)
 
 # --- HELPERS ---
@@ -49,16 +50,41 @@ def _expand_query(q: str) -> str:
         return "sofa couch chair ottoman bench living room seating"
     return q
 
+def _hf_embed(text: str) -> List[float]:
+    """
+    Primary: use the Embeddings API via router (robust).
+    Fallback: call legacy feature_extraction and mean-pool token embeddings if needed.
+    """
+    # New path
+    try:
+        out = embed_client.embeddings(model=EMBED_MODEL_ID, inputs=text, normalize=True)
+        # Handle multiple return shapes across hub versions
+        try:
+            return list(out.data[0].embedding)
+        except Exception:
+            if isinstance(out, dict) and "data" in out and out["data"]:
+                v = out["data"][0].get("embedding", out["data"][0])
+                return list(v)
+            elif isinstance(out, list):
+                return list(out[0]) if out and isinstance(out[0], (list, tuple)) else list(out)
+            return list(out)
+    except Exception:
+        # Legacy fallback (some hubs still support it)
+        vec = embed_client.feature_extraction(text)
+        # vec may be token x dim; mean-pool to sentence
+        if isinstance(vec, list) and vec and isinstance(vec[0], list):
+            vec = [sum(col)/len(col) for col in zip(*vec)]
+        return [float(x) for x in vec]
+
 def encode_query(query: str, w_text: float = 1.0) -> List[float]:
-    vec = embed_client.feature_extraction(query, normalize=True)
+    vec = _hf_embed(query)
     # Ensure TEXT_DIM length
     if len(vec) > TEXT_DIM:
         vec = vec[:TEXT_DIM]
     elif len(vec) < TEXT_DIM:
         vec = vec + [0.0] * (TEXT_DIM - len(vec))
-    # scale text weights
     vec = [w_text * x for x in vec]
-    # pad image part (zeros)
+    # pad image part
     return vec + [0.0] * IMG_DIM
 
 def search(query: str, top_k: int = TOP_K_DEFAULT, w_text: float = 1.0, filt: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
@@ -86,7 +112,6 @@ def filter_hits(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     kept = [r for r in rows if keep(r)]
     if len(kept) >= 2:
         return kept[:5]
-    # add some utility items if needed
     def util(r: Dict[str, Any]) -> bool:
         t = str(r.get("title", "")).lower()
         if any(b in t for b in BAD):
@@ -96,7 +121,7 @@ def filter_hits(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen = set()
     out = []
     for r in kept + extra:
-        if r["id"] in seen: 
+        if r["id"] in seen:
             continue
         out.append(r); seen.add(r["id"])
         if len(out) >= 5:
@@ -108,7 +133,6 @@ def _build_prompt(user_q: str, rows: List[Dict[str, Any]]) -> str:
     for r in rows[:5]:
         ctx_lines.append(f'- {r.get("title","N/A")} (Brand: {r.get("brand","N/A")}, Price: {r.get("price","N/A")})')
     ctx = "\n".join(ctx_lines) if ctx_lines else "No context."
-
     prompt = (
         "You are a concise, helpful product recommendation assistant.\n"
         "Rules (follow strictly):\n"
@@ -125,7 +149,6 @@ def _build_prompt(user_q: str, rows: List[Dict[str, Any]]) -> str:
 def generate_text(user_q: str, rows: List[Dict[str, Any]], max_new_tokens: int = 220) -> str:
     titles = _normalize_titles(rows)
     prompt = _build_prompt(user_q, rows)
-    # deterministic for stability
     txt = gen_client.text_generation(
         prompt,
         max_new_tokens=max_new_tokens,
@@ -135,8 +158,6 @@ def generate_text(user_q: str, rows: List[Dict[str, Any]], max_new_tokens: int =
         stop=None,
         return_full_text=False,
     ).strip()
-
-    # clean up
     txt = re.sub(r"^(sure,?\s*|okay,?\s*|here'?s\s+.*?:\s*)", "", txt, flags=re.I).strip()
     for b in [r"i cannot answer", r"i can't", r"unable", r"not mention", r"no context",
               r"i'm here to assist", r"would you like", r"let me know", r"please note",
@@ -144,18 +165,15 @@ def generate_text(user_q: str, rows: List[Dict[str, Any]], max_new_tokens: int =
         txt = re.sub(b, "", txt, flags=re.I)
     txt = re.sub(r"\s+", " ", txt).strip()
 
-    # ensure ≥2 titles mentioned
     need = [t for t in titles[:3] if t and t not in txt]
     if need:
         txt += " In particular, consider " + " and ".join(f"\"{n}\"" for n in need[:2]) + "."
 
-    # clamp to 4–6 sentences
     sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", txt) if s.strip()]
     while len(sents) < 4:
         sents.append("These options balance comfort, value, and everyday usability at home.")
     txt = " ".join(sents[:6])
 
-    # last-resort fallback
     if sum(1 for t in titles if t in txt) < 2:
         picks = titles[:3]
         if len(picks) >= 2:
@@ -169,7 +187,6 @@ def generate_text(user_q: str, rows: List[Dict[str, Any]], max_new_tokens: int =
         else:
             base = "These options balance comfort, value, and everyday usability at home."
         txt = base
-
     return txt
 
 def rag(query: str, top_k: int | None = None) -> Dict[str, Any]:
