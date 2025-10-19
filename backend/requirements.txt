@@ -1,7 +1,7 @@
 fastapi==0.115.4
 uvicorn[standard]==0.32.0
 python-dotenv==1.0.1
+huggingface-hub==0.25.2
 pinecone==5.3.1
 orjson==3.10.7
-cohere==5.5.8
 requests==2.32.3
