@@ -1,213 +1,228 @@
-# FurniFind — Furniture Recommendations with RAG (Pinecone + HF + Cohere)
+# FurniFind – Multimodal Product Recommendation (RAG)
 
-A production-ready Retrieval-Augmented Generation (RAG) system that recommends furniture products and summarizes the picks in natural language.
+_A smart, context‑aware furniture discovery engine._
 
-- **Search**: Pinecone serverless vector index over **multi‑modal embeddings** (text + image).
-- **Embeddings**: 
-  - Text: `sentence-transformers/all-MiniLM-L6-v2` (384-d) for dataset creation; **runtime query** via Cohere `embed-english-light-v2.0` (384-d).
-  - Image: ResNet‑50 penultimate layer (2048-d).
-  - **Final vector**: 384 + 2048 = **2432-d**, concatenated.
-- **Generation**: Hugging Face Inference **Router** (OpenAI-compatible) with `google/gemma-2-2b-it:nebius`.
-- **Backend**: FastAPI on Render (free).
-- **Frontend**: Vercel (Next.js/React) — calls the FastAPI endpoints.
+> Made with ❤️ by **Devansh** for **Ikarus 3D**
 
 ---
 
-## 1) Repository Layout
+## Overview
+
+FurniFind is a production‑ready, multimodal Retrieval‑Augmented Generation (RAG) system for product recommendations.  
+It blends **text + image embeddings** inside **Pinecone** for accurate retrieval, and uses a lightweight **LLM (Gemma‑2 2B IT via Hugging Face Inference Router)** to write concise, human‑friendly suggestions bounded strictly by retrieved context. The stack is cloud‑friendly and **free‑tier deployable**: **FastAPI on Render** (backend) and **Vite + React on Vercel** (frontend).
+
+---
+
+## Architecture (High Level)
 
 ```
-.
-├── backend/
-│   ├── ai_logic.py          # Retrieval + prompt + generation
-│   ├── main.py              # FastAPI app (CORS, routes)
-│   ├── requirements.txt     # Pinned deps
-│   └── render.yaml          # Render web service
-├── notebooks/
-│   ├── data_analytics_notebook.ipynb   # EDA & cleaning
-│   └── model_training_notebook.ipynb   # Text+image embeddings + Pinecone upsert
-└── frontend/                # Deployed to Vercel (optional in this repo)
+User (Vercel app)
+        │
+        ▼
+Frontend (Vite + React)
+        │  POST /recommend { query, top_k? }
+        ▼
+Backend (FastAPI on Render)
+   ├── Query Embedding  → Cohere (embed-english-light-v2.0)
+   ├── Vector Search    → Pinecone (2432‑D multimodal vectors)
+   ├── Result Filtering → product/category guardrails
+   └── Generation       → Hugging Face Inference Router
+                          model: google/gemma-2-2b-it:nebius (chat/completions)
+        │
+        ▼
+JSON: { recommendations: [...], generated_text: "..." }
 ```
 
 ---
 
-## 2) Data → Indexing Pipeline (notebooks/)
+## Data & Indexing Pipeline
 
-**Goal:** create a single, unified embedding per product covering both **text** and **image** signals.
+**Source:** `cleaned_intern_data.csv` (210 products).
 
-1. **Load dataset**: `cleaned_intern_data.csv` with title, description, categories, images, brand, price, etc.
-2. **Text embedding (384-d)**  
-   - Build `combined_text = title + description + categories + "Material: ..." + "Color: ..."`  
-   - Encode with `sentence-transformers/all-MiniLM-L6-v2` → shape `(N, 384)`.
-3. **Image embedding (2048-d)**  
-   - Download first image URL per product.  
-   - ResNet‑50 (ImageNet weights), take penultimate layer → `(N, 2048)`.
-4. **Concatenate** → `(N, 2432)` and **upsert** to Pinecone:
-   - Index name: `product-recommendations`
-   - Metric: `cosine`
-   - Dimension: `2432`
-   - Serverless spec: `aws | us-east-1`
+**Cleaning & Preprocessing**
+- Dropped rows with missing **price**.
+- Consolidated duplicates by **uniq_id**.
+- Normalized columns and extracted the **first image URL** from mixed formats (list string / list / single URL / NaN).
+- Built a **rich text field** for indexing: `title + description + categories + material + color`.
 
-Each vector stores metadata: `title`, `brand`, `price`, `image_url` for UI rendering.
+**Embeddings (offline, during indexing)**
+- **Text (384‑D):** `sentence-transformers/all-MiniLM-L6-v2`.
+- **Image (2048‑D):** **ResNet‑50** penultimate layer on the first product image (ImageNet normalization).
+- **Multimodal vector (2432‑D):** concatenation `[ text(384) | image(2048) ]`.
 
-> See: `notebooks/model_training_notebook.ipynb` for the exact code used.
+**Vector DB**
+- **Pinecone Serverless** (`metric=cosine`, `dimension=2432`).
+- Upserted vectors with metadata: `title`, `brand`, `price`, `image_url`.
+- Used the **data‑plane host** when available (faster queries).
 
----
-
-## 3) Runtime Retrieval + Generation (backend/ai_logic.py)
-
-**Query embedding:** Cohere `embed-english-light-v2.0` (`input_type="search_query"`) → 384-d, padded with 2048 zeros to 2432-d to match the index.  
-**Search:** Pinecone `query(top_k, include_metadata=True)` → filter + re-rank rules (ban obvious hardware parts, prioritize furniture classes).  
-**Prompting:** compact, single-paragraph guidance that forces mentioning ≥2 context titles.  
-**Generation:** POST to HF Router `v1/chat/completions` with model `google/gemma-2-2b-it:nebius` (OpenAI-compatible response).
+> Result: `total_vector_count = 210`, ready for low‑latency retrieval.
 
 ---
 
-## 4) Backend API
+## Serving (Retrieval + Generation)
 
-Base URL (Render): `https://<your-service>.onrender.com`
+**Query Embedding (at runtime)**
+- **Cohere** `embed-english-light-v2.0` for text queries.
+- Output is shaped to the index schema: kept/padded to **384** for the text block, then appended **2048 zeros** for the image block → final **2432‑D** query vector. This keeps compatibility with the multimodal index without recomputing image features at query time.
 
-### Health
-```
-GET /healthz
-200 → {"status":"ok"}
-```
+**Vector Search (Pinecone)**
+- `top_k` configurable (default **8**).
+- Returns product candidates with metadata.
 
-### Recommendations
-```
-POST /recommend
-Content-Type: application/json
+**Result Filtering (guardrails)**
+- Keeps furniture‑relevant items (`sofa|chair|ottoman|bench|couch|table|tray|armchair|stool`).
+- Excludes hardware/repair/parts (`lever|latch|cable|bracket|replacement|...`).
+- Falls back to utility items when needed (e.g., trays, stools) to guarantee at least two relevant results.
 
-{
-  "query": "sofa",
-  "top_k": 8   // optional, defaults to env TOP_K_DEFAULT
-}
+**Constrained Generation (Hugging Face Router)**
+- Endpoint: **OpenAI‑compatible** `https://router.huggingface.co/v1/chat/completions`.
+- Model: **`google/gemma-2-2b-it:nebius`**.
+- Prompt rules enforce: **single paragraph**, **4–6 sentences**, **no meta‑chat**, **mention ≥2 exact titles from context**.
+- Final message is sanitized (no “Sure/Okay/Here’s”, no emojis, no refusal), with a deterministic fallback if titles were not referenced enough.
+
+---
+
+## API (Backend)
+
+**Base URL (Render):** `https://<your-render-service>.onrender.com`
+
+### `POST /recommend`
+Request
+```json
+{ "query": "looking for a compact sofa under 200", "top_k": 8 }
 ```
-**200 Response**
+Response (shape)
 ```json
 {
   "recommendations": [
     {
-      "id": "bdc9aa30-9439-50dc-8e89-213ea211d66a",
-      "score": 0.023,
-      "title": "Karl home Accent Chair ...",
+      "id": "fe25ae1d-...",
+      "score": 0.0245,
+      "title": "Karl home Accent Chair Mid-Century Modern ...",
       "brand": "Karl home Store",
       "price": 149.99,
-      "image_url": "https://..."
+      "image_url": "https://...jpg"
     }
   ],
-  "generated_text": "Compact 4–6 sentence summary grounded in retrieved items..."
+  "generated_text": "These options offer practical seating ..."
 }
 ```
 
-### Analytics (demo data)
-```
-GET /analytics
-```
+### `GET /analytics`
+Returns small, static sample analytics (brand counts & average price) — useful for the UI’s charts.
 
-**Interactive docs**: `GET /docs` (Swagger UI).
-
----
-
-## 5) Environment Variables
-
-| Key | Example / Notes |
-|---|---|
-| `PINECONE_API_KEY` | Pinecone project key |
-| `PINECONE_INDEX_NAME` | `product-recommendations` |
-| `PINECONE_HOST` | Data-plane host (from `pc.describe_index(index_name).host`) |
-| `HF_TOKEN` | Hugging Face access token (authorized for Gemma 2) |
-| `HF_MODEL_ID` | `google/gemma-2-2b-it:nebius` |
-| `COHERE_API_KEY` | Cohere API key |
-| `EMBED_MODEL_ID` | `embed-english-light-v2.0` |
-| `TEXT_DIM` | `384` |
-| `IMG_DIM` | `2048` |
-| `TOP_K_DEFAULT` | `8` |
-| `ALLOWED_ORIGINS` | Comma-separated origins, e.g. `https://your-frontend.vercel.app` |
-
-> `main.py` consumes `ALLOWED_ORIGINS` for CORS. Set to `"*"` only for local testing.
+### `GET /healthz`
+Simple health probe for Render.
 
 ---
 
-## 6) Local Development
+## Environment Variables
 
-```bash
-cd backend
-python -m venv .venv && source .venv/bin/activate  # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-
-# .env in backend/
-cat > .env << 'EOF'
+### Backend (`backend/.env`)
+```
 PINECONE_API_KEY=...
 PINECONE_INDEX_NAME=product-recommendations
-PINECONE_HOST=... # optional but recommended
-HF_TOKEN=...
-HF_MODEL_ID=google/gemma-2-2b-it:nebius
-COHERE_API_KEY=...
+PINECONE_HOST=...                         # optional (data-plane host)
+
+COHERE_API_KEY=...                        # for runtime query embeddings
 EMBED_MODEL_ID=embed-english-light-v2.0
 TEXT_DIM=384
 IMG_DIM=2048
 TOP_K_DEFAULT=8
-ALLOWED_ORIGINS=http://localhost:5173,http://localhost:3000
-EOF
 
-uvicorn main:app --reload --port 8000
-# Open http://localhost:8000/docs
+HF_TOKEN=...                              # Hugging Face access token
+HF_MODEL_ID=google/gemma-2-2b-it:nebius   # via HF Inference Router
+
+ALLOWED_ORIGINS=https://<your-vercel-app>.vercel.app,http://localhost:5173
+```
+
+### Frontend (`frontend/.env`)
+```
+VITE_API_URL=https://<your-render-service>.onrender.com
 ```
 
 ---
 
-## 7) Deployment
+## Local Development
 
-### Render (Backend)
-- **rootDir**: `backend`
-- **Build**: `pip install -r requirements.txt`
-- **Start**: `uvicorn main:app --host 0.0.0.0 --port $PORT`
-- **Health**: `/healthz`  
-Env vars: same as section 5.
-
-### Vercel (Frontend)
-- Set `NEXT_PUBLIC_API_BASE` (or equivalent) → Render URL.
-- Ensure the backend’s `ALLOWED_ORIGINS` includes the deployed Vercel domain.
-
----
-
-## 8) Retrieval Quality Heuristics
-
-- **GOOD classes**: `sofa, chair, ottoman, bench, couch, table, tray, armchair, stool`
-- **BAD tokens**: `lever, latch, cable, release, hardware, bracket, replacement, webbing, band, repair, modification`  
-- If <2 strong hits, allow **utility** items (`tray|table|ottoman|stool`) while still blocking BAD tokens.
-- Final list capped at **5 items** for clean UX.
-
----
-
-## 9) Tech Stack
-
-- **Vector DB**: Pinecone (serverless, cosine, d=2432)  
-- **Embedding (dataset)**: `sentence-transformers/all-MiniLM-L6-v2`  
-- **Embedding (runtime query)**: Cohere `embed-english-light-v2.0`  
-- **Image model**: ResNet‑50 (torchvision)  
-- **LLM**: `google/gemma-2-2b-it:nebius` via HF Router (`/v1/chat/completions`)  
-- **API**: FastAPI + Uvicorn  
-- **Deploy**: Render (backend), Vercel (frontend)
-
----
-
-## 10) Quick cURL
-
+**Backend**
 ```bash
-curl -X POST "https://<your-service>.onrender.com/recommend"   -H "Content-Type: application/json"   -d '{"query":"ottomans","top_k":8}'
+cd backend
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+cp .env.example .env  # or create .env as above
+uvicorn main:app --reload
+```
+
+**Frontend (Node 20.x)**
+```bash
+cd frontend
+npm i
+echo "VITE_API_URL=http://127.0.0.1:8000" > .env
+npm run dev
 ```
 
 ---
 
-## 11) Notes
+## Deployment
 
-- Keep `PINECONE_HOST` to use the **data-plane** endpoint for lower latency.
-- Ensure Hugging Face token has **access to the Gemma 2** gated model.
-- Do not store secrets in the repo; use `.env` locally and provider env consoles in prod.
+**Render (Backend)**
+- Root: `backend/`
+- Build: `pip install -r requirements.txt`
+- Start: `uvicorn main:app --host 0.0.0.0 --port $PORT`
+- Health check: `/healthz`
+- Add environment variables from the table above.
+- Free tier is sufficient since heavy compute is delegated to Cohere/HF/Pinecone.
+
+**Vercel (Frontend)**
+- Framework: **Vite + React** (Node 20.x).
+- Environment variable: `VITE_API_URL=https://<your-render-service>.onrender.com`.
+- Build: `npm run build`, Output: `dist/`.
 
 ---
 
-## 12) License
+## Tech Stack
 
-Choose a license that suits the intended use (e.g., MIT, Apache-2.0). Add a `LICENSE` file at repo root.
+- **Retrieval:** Pinecone (serverless, cosine, 2432‑D multimodal vectors)
+- **Text Embedding (indexing):** Sentence‑Transformers `all-MiniLM-L6-v2` (384‑D)
+- **Image Embedding (indexing):** ResNet‑50 penultimate layer (2048‑D)
+- **Text Embedding (serving):** Cohere `embed-english-light-v2.0` (384‑D shaped → 2432‑D)
+- **Generation:** HF Inference Router (OpenAI API‑compatible), `google/gemma-2-2b-it:nebius`
+- **Backend:** FastAPI, Uvicorn
+- **Frontend:** Vite + React + Tailwind
+- **Infra:** Render (web service), Vercel (static hosting)
+
+---
+
+## Notes & Limitations
+
+- The generator is **strictly grounded** in retrieved context; if retrieval is sparse, a deterministic fallback summary is returned.
+- The free tier on Render has **~512 MiB** memory; heavy models are not hosted on the server (stateless inference calls).
+- Image features are **precomputed** at indexing time for speed; runtime queries are text‑only embeddings aligned to the same 2432‑D space.
+
+---
+
+## Directory Layout
+
+```
+repo-root/
+├─ backend/
+│  ├─ ai_logic.py
+│  ├─ main.py
+│  ├─ requirements.txt
+│  └─ render.yaml
+├─ frontend/
+│  ├─ index.html
+│  ├─ package.json
+│  ├─ src/
+│  └─ vite.config.ts
+└─ notebooks/  (optional)
+   ├─ data_analytics_notebook.ipynb
+   └─ model_training_notebook.ipynb
+```
+
+---
+
+## License
+
+This project is released for educational and evaluation purposes.
