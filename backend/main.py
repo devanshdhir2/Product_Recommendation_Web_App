@@ -4,7 +4,6 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
-import orjson
 
 from ai_logic import rag
 
@@ -13,14 +12,14 @@ load_dotenv()
 def _split_csv(s: str) -> list[str]:
     return [x.strip() for x in s.split(",") if x.strip()]
 
-origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS","*").split(",") if o.strip()]
+origins = _split_csv(os.getenv("ALLOWED_ORIGINS", "*"))
 
 app = FastAPI(title="FurniFind API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins or ["*"],
-    allow_credentials=False,
+    allow_credentials=False,  # keep False to avoid OPTIONS 400 on Render
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -40,17 +39,13 @@ def healthz():
 @app.post("/recommend")
 def recommend(body: QueryBody):
     try:
-        result = rag(body.query, top_k=body.top_k)
-        return result
+        return rag(body.query, top_k=body.top_k)
     except Exception as e:
         print("ERROR /recommend:", e)
         raise HTTPException(status_code=500, detail="Internal error")
 
-# Optional: simple analytics (static or from a CSV if you add one)
 @app.get("/analytics")
 def analytics():
-    # Minimal placeholder so the UI can render something
-    # If you have backend/data/cleaned_intern_data.csv, you can expand this.
     return {
         "products_per_brand": {
             "Karl home Store": 6,
