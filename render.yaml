@@ -1,11 +1,9 @@
 services:
   - type: web
-    name: furniture-rag-api
+    name: furnifind-backend
     env: python
-    plan: free
+    rootDir: backend
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
-    rootDir: backend
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.9
+    autoDeploy: true
+    healthCheckPath: /healthz
