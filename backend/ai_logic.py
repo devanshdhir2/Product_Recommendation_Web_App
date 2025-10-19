@@ -1,10 +1,11 @@
 import os
 import re
+import json
+import requests # <-- ADD THIS IMPORT
 from typing import List, Dict, Any
 from dotenv import load_dotenv
 from pinecone import Pinecone
-from huggingface_hub import InferenceClient
-import cohere # <-- ADD THIS IMPORT
+import cohere
 
 load_dotenv()
 
@@ -13,10 +14,11 @@ PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "product-recommendations")
 PINECONE_HOST = os.getenv("PINECONE_HOST", "").strip()
 HF_TOKEN = os.getenv("HF_TOKEN", "")
-COHERE_API_KEY = os.getenv("COHERE_API_KEY", "") # <-- ADD THIS
+COHERE_API_KEY = os.getenv("COHERE_API_KEY", "")
 
-HF_MODEL_ID = os.getenv("HF_MODEL_ID", "google/gemma-2b-it")
-EMBED_MODEL_ID = os.getenv("EMBED_MODEL_ID", "embed-english-light-v2.0") # Cohere model
+# This now points to the new provider-specific model ID
+HF_MODEL_ID = os.getenv("HF_MODEL_ID", "google/gemma-2-2b-it:nebius")
+EMBED_MODEL_ID = os.getenv("EMBED_MODEL_ID", "embed-english-light-v2.0")
 TEXT_DIM = int(os.getenv("TEXT_DIM", "384"))
 IMG_DIM = int(os.getenv("IMG_DIM", "2048"))
 TOP_K_DEFAULT = int(os.getenv("TOP_K_DEFAULT", "8"))
@@ -31,17 +33,14 @@ if not COHERE_API_KEY:
 # --- CLIENTS (CHANGED) ---
 pc = Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index(host=PINECONE_HOST) if PINECONE_HOST else pc.Index(PINECONE_INDEX_NAME)
-
-# Use Cohere client for embeddings
 co = cohere.Client(COHERE_API_KEY)
-
-# Keep Hugging Face client for text generation (Gemma)
-gen_client = InferenceClient(model=HF_MODEL_ID, token=HF_TOKEN)
+# The InferenceClient is no longer used, we will call the API directly.
 
 # --- HELPERS ---
 BAD = ("lever","latch","cable","release","hardware","bracket","replacement","webbing","band","repair","modification")
 GOOD = ("sofa","chair","ottoman","bench","couch","table","tray","armchair","stool")
 
+# (No changes to _normalize_titles, _expand_query, encode_query, search, filter_hits, _build_prompt)
 def _normalize_titles(rows: List[Dict[str, Any]]) -> List[str]:
     titles = []
     for r in rows:
@@ -56,21 +55,17 @@ def _expand_query(q: str) -> str:
         return "sofa couch chair ottoman bench living room seating"
     return q
 
-# --- ENCODE FUNCTION (CHANGED) ---
 def encode_query(query: str, w_text: float = 1.0) -> List[float]:
-    # Use the Cohere API to create the embedding
     response = co.embed(
         texts=[query],
         model=EMBED_MODEL_ID,
         input_type="search_query"
     )
     vec = response.embeddings[0]
-
     if len(vec) > TEXT_DIM:
         vec = vec[:TEXT_DIM]
     elif len(vec) < TEXT_DIM:
         vec = vec + [0.0] * (TEXT_DIM - len(vec))
-
     vec = [w_text * x for x in vec]
     return vec + [0.0] * IMG_DIM
 
@@ -91,28 +86,23 @@ def search(query: str, top_k: int = TOP_K_DEFAULT, w_text: float = 1.0, filt: Di
     return out
 
 def filter_hits(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if not rows:
-        return rows
+    if not rows: return rows
     def keep(r: Dict[str, Any]) -> bool:
         t = str(r.get("title", "")).lower()
         return any(g in t for g in GOOD) and not any(b in t for b in BAD)
     kept = [r for r in rows if keep(r)]
-    if len(kept) >= 2:
-        return kept[:5]
+    if len(kept) >= 2: return kept[:5]
     def util(r: Dict[str, Any]) -> bool:
         t = str(r.get("title", "")).lower()
-        if any(b in t for b in BAD):
-            return False
+        if any(b in t for b in BAD): return False
         return bool(re.search(r"(tray|table|ottoman|stool)", t))
     extra = [r for r in rows if util(r)]
     seen = set()
     out = []
     for r in kept + extra:
-        if r["id"] in seen: 
-            continue
+        if r["id"] in seen: continue
         out.append(r); seen.add(r["id"])
-        if len(out) >= 5:
-            break
+        if len(out) >= 5: break
     return out if out else rows[:5]
 
 def _build_prompt(user_q: str, rows: List[Dict[str, Any]]) -> str:
@@ -120,7 +110,6 @@ def _build_prompt(user_q: str, rows: List[Dict[str, Any]]) -> str:
     for r in rows[:5]:
         ctx_lines.append(f'- {r.get("title","N/A")} (Brand: {r.get("brand","N/A")}, Price: {r.get("price","N/A")})')
     ctx = "\n".join(ctx_lines) if ctx_lines else "No context."
-
     prompt = (
         "You are a concise, helpful product recommendation assistant.\n"
         "Rules (follow strictly):\n"
@@ -134,20 +123,43 @@ def _build_prompt(user_q: str, rows: List[Dict[str, Any]]) -> str:
     )
     return prompt
 
+# --- GENERATE TEXT FUNCTION (COMPLETELY REWRITTEN) ---
 def generate_text(user_q: str, rows: List[Dict[str, Any]], max_new_tokens: int = 220) -> str:
-    # This function does not need to change
     titles = _normalize_titles(rows)
     prompt = _build_prompt(user_q, rows)
-    txt = gen_client.text_generation(
-        prompt,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        temperature=0.0,
-        repetition_penalty=1.05,
-        stop=None,
-        return_full_text=False,
-    ).strip()
 
+    # New API endpoint and headers
+    api_url = "https://router.huggingface.co/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {HF_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    # New OpenAI-compatible payload
+    payload = {
+        "model": HF_MODEL_ID,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_new_tokens,
+        "temperature": 0.1, # Using a low temp for deterministic output
+        "stream": False
+    }
+
+    txt = ""
+    try:
+        # Make the request
+        response = requests.post(api_url, headers=headers, data=json.dumps(payload))
+        response.raise_for_status() # Raise an exception for bad status codes
+
+        # Extract the text from the new response structure
+        result = response.json()
+        txt = result['choices'][0]['message']['content'].strip()
+
+    except requests.exceptions.RequestException as e:
+        print(f"Error calling Hugging Face API: {e}")
+        # Fallback in case of API error
+        txt = "Based on your request, several options could be a good fit."
+
+    # (The rest of this function's cleanup logic remains the same)
     txt = re.sub(r"^(sure,?\s*|okay,?\s*|here'?s\s+.*?:\s*)", "", txt, flags=re.I).strip()
     for b in [r"i cannot answer", r"i can't", r"unable", r"not mention", r"no context",
                 r"i'm here to assist", r"would you like", r"let me know", r"please note",
@@ -177,7 +189,6 @@ def generate_text(user_q: str, rows: List[Dict[str, Any]], max_new_tokens: int =
         else:
             base = "These options balance comfort, value, and everyday usability at home."
         txt = base
-
     return txt
 
 def rag(query: str, top_k: int | None = None) -> Dict[str, Any]:
